@@ -1,0 +1,280 @@
+use std::{
+	collections::{HashMap, HashSet},
+	env,
+	error::Error,
+	ffi::OsStr,
+	fs,
+	path::{Path, PathBuf},
+	process,
+};
+
+use regex::Regex;
+use serde::Deserialize;
+use serde_json::Value;
+
+#[derive(Deserialize)]
+struct Manifest {
+	#[serde(default)]
+	version: Option<String>,
+	#[serde(default)]
+	bin: Option<Value>,
+}
+
+#[derive(Clone)]
+struct SearchResult {
+	name: String,
+	version: String,
+	bucket: String,
+	binaries: String,
+}
+
+fn scoop_root() -> PathBuf {
+	if let Ok(root) = env::var("SCOOP") {
+		if !root.is_empty() {
+			return PathBuf::from(root);
+		}
+	}
+	match env::var("USERPROFILE") {
+		Ok(home) if !home.is_empty() => PathBuf::from(home).join("scoop"),
+		_ => {
+			eprintln!("fastscoop: cannot determine home directory");
+			process::exit(1);
+		}
+	}
+}
+
+fn buckets_dir() -> PathBuf {
+	scoop_root().join("buckets")
+}
+
+fn known_buckets() -> Option<Vec<String>> {
+	let path = scoop_root().join("apps").join("scoop").join("current").join("buckets.json");
+	let data = fs::read(&path).ok()?;
+	let v: Value = serde_json::from_slice(&data).ok()?;
+	let obj = v.as_object()?;
+	let mut keys = Vec::with_capacity(obj.len());
+	for (k, _) in obj.iter() {
+		keys.push(k.clone());
+	}
+	Some(keys)
+}
+
+fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
+	let mut bucket_names: Vec<String> = Vec::new();
+	for entry in fs::read_dir(buckets_dir())? {
+		let entry = entry?;
+		if entry.file_type()?.is_dir() {
+			if let Some(name) = entry.file_name().to_str() {
+				bucket_names.push(name.to_string());
+			}
+		}
+	}
+	bucket_names.sort();
+	let known = known_buckets().unwrap_or_default();
+	if known.is_empty() {
+		return Ok(bucket_names);
+	}
+	let present: HashSet<&str> = bucket_names.iter().map(|s| s.as_str()).collect();
+	let mut seen: HashSet<String> = HashSet::new();
+	let mut ordered: Vec<String> = Vec::with_capacity(bucket_names.len());
+
+	for name in known {
+		if present.contains(name.as_str()) {
+			ordered.push(name.clone());
+			seen.insert(name);
+		}
+	}
+	for b in bucket_names {
+		if !seen.contains(&b) {
+			ordered.push(b);
+		}
+	}
+	Ok(ordered)
+}
+
+fn load_manifest(path: &Path) -> Option<(String, String, Option<Value>)> {
+	let file_name = path.file_name()?.to_str()?;
+	if !file_name.ends_with(".json") {
+		return None;
+	}
+	let stem = file_name.strip_suffix(".json")?.to_string();
+	let data = fs::read(path).ok()?;
+	let m: Manifest = serde_json::from_slice(&data).ok()?;
+	let version = m.version.unwrap_or_default();
+	Some((stem, version, m.bin))
+}
+
+fn match_bin_string(bin: &str, re: &Regex) -> Option<String> {
+	let base = Path::new(bin).file_name().and_then(|s| s.to_str()).unwrap_or(bin);
+	let ext = Path::new(base).extension().and_then(|s| s.to_str()).unwrap_or("");
+	let name = if ext.is_empty() { base } else { base.strip_suffix(&format!(".{}", ext)).unwrap_or(base) };
+	if re.is_match(name) { Some(base.to_string()) } else { None }
+}
+
+fn match_bins(bin: &Option<Value>, re: &Regex) -> Vec<String> {
+	let mut matches: Vec<String> = Vec::new();
+	let Some(v) = bin else {
+		return matches;
+	};
+	match v {
+		Value::String(s) => {
+			if let Some(m) = match_bin_string(s, re) {
+				matches.push(m);
+			}
+		}
+		Value::Array(arr) => {
+			for item in arr {
+				match item {
+					Value::String(s) => {
+						if let Some(m) = match_bin_string(s, re) {
+							matches.push(m);
+						}
+					}
+					Value::Array(args) => {
+						if let Some(Value::String(exe)) = args.get(0) {
+							if let Some(m) = match_bin_string(exe, re) {
+								matches.push(m);
+								continue;
+							}
+						}
+						if let Some(Value::String(alias)) = args.get(1) {
+							if re.is_match(alias) {
+								matches.push(alias.clone());
+							}
+						}
+					}
+					_ => {}
+				}
+			}
+		}
+		_ => {}
+	}
+	matches
+}
+
+fn walk_manifests(buckets: &[String], mut f: impl FnMut(&str, &Path)) {
+	let buckets_path = buckets_dir();
+	for bucket in buckets {
+		let bucket_path = buckets_path.join(bucket).join("bucket");
+		let Ok(entries) = fs::read_dir(&bucket_path) else {
+			continue;
+		};
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if path.extension() == Some(OsStr::new("json")) {
+				f(bucket, &path);
+			}
+		}
+	}
+}
+
+fn sort_results(results: &mut [SearchResult], bucket_order: &[String]) {
+	if results.len() < 2 {
+		return;
+	}
+	let mut order_index: HashMap<&str, usize> = HashMap::with_capacity(bucket_order.len());
+	for (i, b) in bucket_order.iter().enumerate() {
+		order_index.insert(b.as_str(), i);
+	}
+	let unknown_index = bucket_order.len() + 1;
+	results.sort_by(|a, b| {
+		let ai = order_index.get(a.bucket.as_str()).copied().unwrap_or(unknown_index);
+		let bi = order_index.get(b.bucket.as_str()).copied().unwrap_or(unknown_index);
+		ai.cmp(&bi).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())).then_with(|| a.name.cmp(&b.name))
+	});
+}
+
+fn print_results(results: &[SearchResult]) {
+	if results.is_empty() {
+		println!("No matches found.");
+		return;
+	}
+	println!("Results from local buckets...\n");
+	let name_h = "Name";
+	let version_h = "Version";
+	let source_h = "Source";
+	let binaries_h = "Binaries";
+	let mut name_w = name_h.len();
+	let mut version_w = version_h.len();
+	let mut source_w = source_h.len();
+	let mut binaries_w = binaries_h.len();
+	for r in results {
+		name_w = name_w.max(r.name.len());
+		version_w = version_w.max(r.version.len());
+		source_w = source_w.max(r.bucket.len());
+		binaries_w = binaries_w.max(r.binaries.len());
+	}
+	println!(
+		"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
+		name_h,
+		version_h,
+		source_h,
+		binaries_h,
+		name_w = name_w,
+		version_w = version_w,
+		source_w = source_w,
+		binaries_w = binaries_w
+	);
+	println!(
+		"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
+		"-".repeat(name_h.len()),
+		"-".repeat(version_h.len()),
+		"-".repeat(source_h.len()),
+		"-".repeat(binaries_h.len()),
+		name_w = name_w,
+		version_w = version_w,
+		source_w = source_w,
+		binaries_w = binaries_w
+	);
+	for r in results {
+		println!(
+			"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
+			r.name,
+			r.version,
+			r.bucket,
+			r.binaries,
+			name_w = name_w,
+			version_w = version_w,
+			source_w = source_w,
+			binaries_w = binaries_w
+		);
+	}
+}
+
+fn run() -> Result<i32, Box<dyn Error>> {
+	let args: Vec<String> = env::args().collect();
+	if args.len() < 3 || args[1] != "search" {
+		println!("usage: fastscoop search <query>");
+		return Ok(1);
+	}
+	let query = &args[2];
+	let re = Regex::new(&format!("(?i){}", query)).map_err(|e| format!("Invalid regular expression: {}", e))?;
+	let bucket_order = local_buckets()?;
+	let mut results: Vec<SearchResult> = Vec::with_capacity(128);
+	walk_manifests(&bucket_order, |bucket, path| {
+		let Some((name, version, bin)) = load_manifest(path) else {
+			return;
+		};
+		if re.is_match(&name) {
+			results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
+			return;
+		}
+		let bins = match_bins(&bin, &re);
+		if !bins.is_empty() {
+			results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: bins.join(" | ") });
+		}
+	});
+	sort_results(&mut results, &bucket_order);
+	print_results(&results);
+	if results.is_empty() { Ok(1) } else { Ok(0) }
+}
+
+fn main() {
+	match run() {
+		Ok(code) => process::exit(code),
+		Err(err) => {
+			eprintln!("{}", err);
+			process::exit(1);
+		}
+	}
+}
