@@ -1,7 +1,11 @@
 [package]
 name = "fastscoop"
+description = "A fast, drop-in replacement for `scoop search`."
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/trypsynth/fastscoop"
+rust-version = "1.88.0"
 
 [dependencies]
 regex = "1.12.2"

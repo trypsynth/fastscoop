@@ -1,4 +1,4 @@
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
 
 use std::{
 	collections::{HashMap, HashSet},
