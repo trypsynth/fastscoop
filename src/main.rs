@@ -29,10 +29,10 @@ struct SearchResult {
 }
 
 fn scoop_root() -> PathBuf {
-	if let Ok(root) = env::var("SCOOP") {
-		if !root.is_empty() {
-			return PathBuf::from(root);
-		}
+	if let Ok(root) = env::var("SCOOP")
+		&& !root.is_empty()
+	{
+		return PathBuf::from(root);
 	}
 	match env::var("USERPROFILE") {
 		Ok(home) if !home.is_empty() => PathBuf::from(home).join("scoop"),
@@ -63,10 +63,10 @@ fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
 	let mut bucket_names: Vec<String> = Vec::new();
 	for entry in fs::read_dir(buckets_dir())? {
 		let entry = entry?;
-		if entry.file_type()?.is_dir() {
-			if let Some(name) = entry.file_name().to_str() {
-				bucket_names.push(name.to_string());
-			}
+		if entry.file_type()?.is_dir()
+			&& let Some(name) = entry.file_name().to_str()
+		{
+			bucket_names.push(name.to_string());
 		}
 	}
 	bucket_names.sort();
@@ -131,16 +131,16 @@ fn match_bins(bin: &Option<Value>, re: &Regex) -> Vec<String> {
 						}
 					}
 					Value::Array(args) => {
-						if let Some(Value::String(exe)) = args.get(0) {
-							if let Some(m) = match_bin_string(exe, re) {
-								matches.push(m);
-								continue;
-							}
+						if let Some(Value::String(exe)) = args.first()
+							&& let Some(m) = match_bin_string(exe, re)
+						{
+							matches.push(m);
+							continue;
 						}
-						if let Some(Value::String(alias)) = args.get(1) {
-							if re.is_match(alias) {
-								matches.push(alias.clone());
-							}
+						if let Some(Value::String(alias)) = args.get(1)
+							&& re.is_match(alias)
+						{
+							matches.push(alias.clone());
 						}
 					}
 					_ => {}
