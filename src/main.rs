@@ -1,3 +1,5 @@
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+
 use std::{
 	collections::{HashMap, HashSet},
 	env,
@@ -53,7 +55,7 @@ fn known_buckets() -> Option<Vec<String>> {
 	let v: Value = serde_json::from_slice(&data).ok()?;
 	let obj = v.as_object()?;
 	let mut keys = Vec::with_capacity(obj.len());
-	for (k, _) in obj.iter() {
+	for (k, _) in obj {
 		keys.push(k.clone());
 	}
 	Some(keys)
@@ -74,7 +76,7 @@ fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
 	if known.is_empty() {
 		return Ok(bucket_names);
 	}
-	let present: HashSet<&str> = bucket_names.iter().map(|s| s.as_str()).collect();
+	let present: HashSet<&str> = bucket_names.iter().map(std::string::String::as_str).collect();
 	let mut seen: HashSet<String> = HashSet::new();
 	let mut ordered: Vec<String> = Vec::with_capacity(bucket_names.len());
 
@@ -107,7 +109,7 @@ fn load_manifest(path: &Path) -> Option<(String, String, Option<Value>)> {
 fn match_bin_string(bin: &str, re: &Regex) -> Option<String> {
 	let base = Path::new(bin).file_name().and_then(|s| s.to_str()).unwrap_or(bin);
 	let ext = Path::new(base).extension().and_then(|s| s.to_str()).unwrap_or("");
-	let name = if ext.is_empty() { base } else { base.strip_suffix(&format!(".{}", ext)).unwrap_or(base) };
+	let name = if ext.is_empty() { base } else { base.strip_suffix(&format!(".{ext}")).unwrap_or(base) };
 	if re.is_match(name) { Some(base.to_string()) } else { None }
 }
 
@@ -205,15 +207,7 @@ fn print_results(results: &[SearchResult]) {
 		binaries_w = binaries_w.max(r.binaries.len());
 	}
 	println!(
-		"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
-		name_h,
-		version_h,
-		source_h,
-		binaries_h,
-		name_w = name_w,
-		version_w = version_w,
-		source_w = source_w,
-		binaries_w = binaries_w
+		"{name_h:<name_w$}  {version_h:<version_w$}  {source_h:<source_w$}  {binaries_h:<binaries_w$}"
 	);
 	println!(
 		"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
@@ -248,7 +242,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 		return Ok(1);
 	}
 	let query = &args[2];
-	let re = Regex::new(&format!("(?i){}", query)).map_err(|e| format!("Invalid regular expression: {}", e))?;
+	let re = Regex::new(&format!("(?i){query}")).map_err(|e| format!("Invalid regular expression: {e}"))?;
 	let bucket_order = local_buckets()?;
 	let mut results: Vec<SearchResult> = Vec::with_capacity(128);
 	walk_manifests(&bucket_order, |bucket, path| {
@@ -273,7 +267,7 @@ fn main() {
 	match run() {
 		Ok(code) => process::exit(code),
 		Err(err) => {
-			eprintln!("{}", err);
+			eprintln!("{err}");
 			process::exit(1);
 		}
 	}
