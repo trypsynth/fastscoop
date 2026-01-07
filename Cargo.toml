@@ -6,6 +6,9 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/trypsynth/fastscoop"
 rust-version = "1.88.0"
+readme = "README.md"
+keywords = ["scoop", "search", "windows", "package-manager", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 regex = "1.12.2"
