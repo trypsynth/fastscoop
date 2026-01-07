@@ -7,7 +7,7 @@ use std::{
 	ffi::OsStr,
 	fs,
 	path::{Path, PathBuf},
-	process,
+	process, string,
 };
 
 use regex::Regex;
@@ -76,7 +76,7 @@ fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
 	if known.is_empty() {
 		return Ok(bucket_names);
 	}
-	let present: HashSet<&str> = bucket_names.iter().map(std::string::String::as_str).collect();
+	let present: HashSet<&str> = bucket_names.iter().map(string::String::as_str).collect();
 	let mut seen: HashSet<String> = HashSet::new();
 	let mut ordered: Vec<String> = Vec::with_capacity(bucket_names.len());
 
@@ -96,7 +96,7 @@ fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
 
 fn load_manifest(path: &Path) -> Option<(String, String, Option<Value>)> {
 	let file_name = path.file_name()?.to_str()?;
-	if !file_name.ends_with(".json") {
+	if !Path::new(file_name).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
 		return None;
 	}
 	let stem = file_name.strip_suffix(".json")?.to_string();
@@ -113,7 +113,7 @@ fn match_bin_string(bin: &str, re: &Regex) -> Option<String> {
 	if re.is_match(name) { Some(base.to_string()) } else { None }
 }
 
-fn match_bins(bin: &Option<Value>, re: &Regex) -> Vec<String> {
+fn match_bins(bin: Option<&Value>, re: &Regex) -> Vec<String> {
 	let mut matches: Vec<String> = Vec::new();
 	let Some(v) = bin else {
 		return matches;
@@ -206,9 +206,7 @@ fn print_results(results: &[SearchResult]) {
 		source_w = source_w.max(r.bucket.len());
 		binaries_w = binaries_w.max(r.binaries.len());
 	}
-	println!(
-		"{name_h:<name_w$}  {version_h:<version_w$}  {source_h:<source_w$}  {binaries_h:<binaries_w$}"
-	);
+	println!("{name_h:<name_w$}  {version_h:<version_w$}  {source_h:<source_w$}  {binaries_h:<binaries_w$}");
 	println!(
 		"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
 		"-".repeat(name_h.len()),
@@ -253,7 +251,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 			results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
 			return;
 		}
-		let bins = match_bins(&bin, &re);
+		let bins = match_bins(bin.as_ref(), &re);
 		if !bins.is_empty() {
 			results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: bins.join(" | ") });
 		}
