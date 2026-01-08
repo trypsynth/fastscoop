@@ -21,7 +21,3 @@ The query is a case-insensitive regex. Searches package names and binary names a
 ## Output
 
 The goal is to have the output be identical to existing Scoop commands, in order to make scripts able to remain unchanged once the binary is put in the right place and aliased. Fastscoop should only make Scoop faster, absolutely nothing more.
-
-## License
-
-[MIT](LICENSE)

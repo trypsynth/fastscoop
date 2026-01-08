@@ -13,6 +13,7 @@ use std::{
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
+use ureq::Agent;
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -28,6 +29,37 @@ struct SearchResult {
 	version: String,
 	bucket: String,
 	binaries: String,
+}
+
+#[derive(Clone)]
+struct RemoteResult {
+	name: String,
+	bucket: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubTree {
+	tree: Vec<GitHubTreeEntry>,
+}
+
+#[derive(Deserialize)]
+struct GitHubTreeEntry {
+	path: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubRateLimit {
+	resources: GitHubResources,
+}
+
+#[derive(Deserialize)]
+struct GitHubResources {
+	core: GitHubRateLimitCore,
+}
+
+#[derive(Deserialize)]
+struct GitHubRateLimitCore {
+	remaining: u32,
 }
 
 fn scoop_root() -> PathBuf {
@@ -61,6 +93,97 @@ fn known_buckets() -> Option<Vec<String>> {
 	Some(keys)
 }
 
+fn known_bucket_repos() -> Option<HashMap<String, String>> {
+	let path = scoop_root().join("apps").join("scoop").join("current").join("buckets.json");
+	let data = fs::read(&path).ok()?;
+	let v: Value = serde_json::from_slice(&data).ok()?;
+	let obj = v.as_object()?;
+	let mut repos = HashMap::with_capacity(obj.len());
+	for (name, url) in obj {
+		if let Some(url_str) = url.as_str() {
+			repos.insert(name.clone(), url_str.to_string());
+		}
+	}
+	Some(repos)
+}
+
+fn github_token() -> Option<String> {
+	env::var("GH_TOKEN").or_else(|_| env::var("GITHUB_TOKEN")).ok().filter(|s| !s.is_empty())
+}
+
+fn create_agent() -> Agent {
+	Agent::new_with_defaults()
+}
+
+fn github_request(agent: &Agent, url: &str) -> Result<ureq::Body, ureq::Error> {
+	let mut req = agent.get(url).header("User-Agent", "fastscoop");
+	if let Some(token) = github_token() {
+		req = req.header("Authorization", &format!("Bearer {token}"));
+	}
+	Ok(req.call()?.into_body())
+}
+
+fn github_rate_limit_ok(agent: &Agent) -> bool {
+	let Ok(mut body) = github_request(agent, "https://api.github.com/rate_limit") else {
+		return false;
+	};
+	let Ok(rate_limit) = body.read_json::<GitHubRateLimit>() else {
+		return false;
+	};
+	rate_limit.resources.core.remaining > 0
+}
+
+fn parse_github_repo(url: &str) -> Option<(String, String)> {
+	let url = url.trim_end_matches(".git");
+	let parts: Vec<&str> = url.split('/').collect();
+	if parts.len() >= 2 {
+		let repo = parts[parts.len() - 1].to_string();
+		let user = parts[parts.len() - 2].to_string();
+		if !user.is_empty() && !repo.is_empty() {
+			return Some((user, repo));
+		}
+	}
+	None
+}
+
+fn search_remote_bucket(agent: &Agent, bucket: &str, url: &str, re: &Regex) -> Vec<RemoteResult> {
+	let mut results = Vec::new();
+	let Some((user, repo)) = parse_github_repo(url) else {
+		return results;
+	};
+	let api_url = format!("https://api.github.com/repos/{user}/{repo}/git/trees/HEAD?recursive=1");
+	let Ok(mut body) = github_request(agent, &api_url) else {
+		return results;
+	};
+	let Ok(tree) = body.read_json::<GitHubTree>() else {
+		return results;
+	};
+	for entry in tree.tree {
+		if let Some(name) = entry.path.strip_prefix("bucket/").and_then(|p| p.strip_suffix(".json"))
+			&& re.is_match(name)
+		{
+			results.push(RemoteResult { name: name.to_string(), bucket: bucket.to_string() });
+		}
+	}
+	results
+}
+
+fn search_remote_buckets(agent: &Agent, local_buckets: &[String], re: &Regex) -> Vec<RemoteResult> {
+	let Some(known_repos) = known_bucket_repos() else {
+		return Vec::new();
+	};
+	let local_set: HashSet<&str> = local_buckets.iter().map(String::as_str).collect();
+	let mut results = Vec::new();
+	for (bucket, url) in &known_repos {
+		if local_set.contains(bucket.as_str()) {
+			continue;
+		}
+		results.extend(search_remote_bucket(agent, bucket, url, re));
+	}
+	results.sort_by(|a, b| a.bucket.cmp(&b.bucket).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+	results
+}
+
 fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
 	let mut bucket_names: Vec<String> = Vec::new();
 	for entry in fs::read_dir(buckets_dir())? {
@@ -79,7 +202,6 @@ fn local_buckets() -> Result<Vec<String>, Box<dyn Error>> {
 	let present: HashSet<&str> = bucket_names.iter().map(string::String::as_str).collect();
 	let mut seen: HashSet<String> = HashSet::new();
 	let mut ordered: Vec<String> = Vec::with_capacity(bucket_names.len());
-
 	for name in known {
 		if present.contains(name.as_str()) {
 			ordered.push(name.clone());
@@ -186,12 +308,10 @@ fn sort_results(results: &mut [SearchResult], bucket_order: &[String]) {
 	});
 }
 
-fn print_results(results: &[SearchResult]) {
-	if results.is_empty() {
-		println!("No matches found.");
-		return;
+fn print_results(results: &[SearchResult], show_header: bool) {
+	if show_header {
+		println!("Results from local buckets...\n");
 	}
-	println!("Results from local buckets...\n");
 	let name_h = "Name";
 	let version_h = "Version";
 	let source_h = "Source";
@@ -233,32 +353,90 @@ fn print_results(results: &[SearchResult]) {
 	}
 }
 
+fn print_remote_results(results: &[RemoteResult]) {
+	println!("\nResults from other known buckets...");
+	println!("(add them using 'scoop bucket add <bucket name>')\n");
+	let name_h = "Name";
+	let source_h = "Source";
+	let mut name_w = name_h.len();
+	let mut source_w = source_h.len();
+	for r in results {
+		name_w = name_w.max(r.name.len());
+		source_w = source_w.max(r.bucket.len());
+	}
+	println!("{name_h:<name_w$}  {source_h:<source_w$}");
+	println!(
+		"{:<name_w$}  {:<source_w$}",
+		"-".repeat(name_h.len()),
+		"-".repeat(source_h.len()),
+		name_w = name_w,
+		source_w = source_w
+	);
+	for r in results {
+		println!("{:<name_w$}  {:<source_w$}", r.name, r.bucket, name_w = name_w, source_w = source_w);
+	}
+}
+
 fn run() -> Result<i32, Box<dyn Error>> {
 	let args: Vec<String> = env::args().collect();
-	if args.len() < 3 || args[1] != "search" {
-		println!("usage: fastscoop search <query>");
+	if args.len() < 2 || args[1] != "search" {
+		println!("usage: fastscoop search [query]");
 		return Ok(1);
 	}
-	let query = &args[2];
-	let re = Regex::new(&format!("(?i){query}")).map_err(|e| format!("Invalid regular expression: {e}"))?;
 	let bucket_order = local_buckets()?;
 	let mut results: Vec<SearchResult> = Vec::with_capacity(128);
+	let query = args.get(2);
+	let re = match query {
+		Some(q) => Some(Regex::new(&format!("(?i){q}")).map_err(|e| format!("Invalid regular expression: {e}"))?),
+		None => None,
+	};
 	walk_manifests(&bucket_order, |bucket, path| {
 		let Some((name, version, bin)) = load_manifest(path) else {
 			return;
 		};
-		if re.is_match(&name) {
-			results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
-			return;
-		}
-		let bins = match_bins(bin.as_ref(), &re);
-		if !bins.is_empty() {
-			results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: bins.join(" | ") });
+		match &re {
+			Some(re) => {
+				if re.is_match(&name) {
+					results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
+					return;
+				}
+				let bins = match_bins(bin.as_ref(), re);
+				if !bins.is_empty() {
+					results.push(SearchResult {
+						name,
+						version,
+						bucket: bucket.to_string(),
+						binaries: bins.join(" | "),
+					});
+				}
+			}
+			None => {
+				results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
+			}
 		}
 	});
 	sort_results(&mut results, &bucket_order);
-	print_results(&results);
-	if results.is_empty() { Ok(1) } else { Ok(0) }
+	let has_local_results = !results.is_empty();
+	if has_local_results {
+		print_results(&results, query.is_some());
+		return Ok(0);
+	}
+	if let Some(q) = query {
+		let re = Regex::new(&format!("(?i){q}"))?;
+		let agent = create_agent();
+		if !github_rate_limit_ok(&agent) {
+			eprintln!("GitHub API rate limit exceeded. Set GH_TOKEN or GITHUB_TOKEN for higher limits.");
+			println!("No matches found.");
+			return Ok(1);
+		}
+		let remote_results = search_remote_buckets(&agent, &bucket_order, &re);
+		if !remote_results.is_empty() {
+			print_remote_results(&remote_results);
+			return Ok(0);
+		}
+	}
+	println!("No matches found.");
+	Ok(1)
 }
 
 fn main() {
