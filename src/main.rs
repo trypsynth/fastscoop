@@ -8,12 +8,15 @@ use std::{
 	fs,
 	path::{Path, PathBuf},
 	process, string,
+	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ureq::Agent;
+
+const GITHUB_CACHE_TTL: Duration = Duration::from_secs(3 * 60 * 60);
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -37,12 +40,12 @@ struct RemoteResult {
 	bucket: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct GitHubTree {
 	tree: Vec<GitHubTreeEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct GitHubTreeEntry {
 	path: String,
 }
@@ -62,6 +65,18 @@ struct GitHubRateLimitCore {
 	remaining: u32,
 }
 
+#[derive(Deserialize)]
+struct ScoopConfig {
+	cache_path: Option<String>,
+	gh_token: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct GitHubTreeCache {
+	fetched_at: u64,
+	tree: GitHubTree,
+}
+
 fn scoop_root() -> PathBuf {
 	if let Ok(root) = env::var("SCOOP")
 		&& !root.is_empty()
@@ -79,6 +94,41 @@ fn scoop_root() -> PathBuf {
 
 fn buckets_dir() -> PathBuf {
 	scoop_root().join("buckets")
+}
+
+fn scoop_config_path() -> Option<PathBuf> {
+	let config_home = env::var("XDG_CONFIG_HOME")
+		.or_else(|_| env::var("USERPROFILE").map(|p| format!("{p}\\.config")))
+		.ok()
+		.filter(|p| !p.is_empty())?;
+	let default_path = PathBuf::from(config_home).join("scoop").join("config.json");
+	let portable_path = scoop_root().join("config.json");
+	if portable_path.exists() { Some(portable_path) } else { Some(default_path) }
+}
+
+fn scoop_config() -> Option<ScoopConfig> {
+	let path = scoop_config_path()?;
+	let data = fs::read(path).ok()?;
+	serde_json::from_slice(&data).ok()
+}
+
+fn scoop_cache_dir() -> PathBuf {
+	if let Ok(path) = env::var("SCOOP_CACHE")
+		&& !path.is_empty()
+	{
+		return PathBuf::from(path);
+	}
+	if let Some(config) = scoop_config()
+		&& let Some(path) = config.cache_path
+		&& !path.is_empty()
+	{
+		return PathBuf::from(path);
+	}
+	scoop_root().join("cache")
+}
+
+fn github_cache_dir() -> PathBuf {
+	scoop_cache_dir().join("fastscoop").join("github")
 }
 
 fn known_buckets() -> Option<Vec<String>> {
@@ -108,7 +158,22 @@ fn known_bucket_repos() -> Option<HashMap<String, String>> {
 }
 
 fn github_token() -> Option<String> {
-	env::var("GH_TOKEN").or_else(|_| env::var("GITHUB_TOKEN")).ok().filter(|s| !s.is_empty())
+	if let Ok(token) = env::var("SCOOP_GH_TOKEN")
+		&& !token.is_empty()
+	{
+		return Some(token);
+	}
+	if let Ok(token) = env::var("GH_TOKEN")
+		&& !token.is_empty()
+	{
+		return Some(token);
+	}
+	if let Ok(token) = env::var("GITHUB_TOKEN")
+		&& !token.is_empty()
+	{
+		return Some(token);
+	}
+	scoop_config()?.gh_token.filter(|s| !s.is_empty())
 }
 
 fn create_agent() -> Agent {
@@ -146,16 +211,82 @@ fn parse_github_repo(url: &str) -> Option<(String, String)> {
 	None
 }
 
+fn github_cache_key(value: &str) -> String {
+	value.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect()
+}
+
+fn github_cache_path(user: &str, repo: &str) -> PathBuf {
+	let file_name = format!("{}__{}.json", github_cache_key(user), github_cache_key(repo));
+	github_cache_dir().join(file_name)
+}
+
+fn unix_timestamp() -> Option<u64> {
+	SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+fn read_cached_tree(path: &Path) -> Option<GitHubTree> {
+	let data = fs::read(path).ok()?;
+	let cache: GitHubTreeCache = serde_json::from_slice(&data).ok()?;
+	let now = unix_timestamp()?;
+	if now.saturating_sub(cache.fetched_at) <= GITHUB_CACHE_TTL.as_secs() { Some(cache.tree) } else { None }
+}
+
+fn write_cached_tree(path: &Path, tree: GitHubTree) {
+	let Some(now) = unix_timestamp() else {
+		return;
+	};
+	let cache = GitHubTreeCache { fetched_at: now, tree };
+	let Ok(data) = serde_json::to_vec(&cache) else {
+		return;
+	};
+	if let Some(parent) = path.parent() {
+		let _ = fs::create_dir_all(parent);
+	}
+	let _ = fs::write(path, data);
+}
+
+fn github_tree_cached(agent: &Agent, user: &str, repo: &str) -> Option<GitHubTree> {
+	let cache_path = github_cache_path(user, repo);
+	if let Some(tree) = read_cached_tree(&cache_path) {
+		return Some(tree);
+	}
+	let api_url = format!("https://api.github.com/repos/{user}/{repo}/git/trees/HEAD?recursive=1");
+	let mut body = github_request(agent, &api_url).ok()?;
+	let tree = body.read_json::<GitHubTree>().ok()?;
+	write_cached_tree(&cache_path, tree.clone());
+	Some(tree)
+}
+
+fn github_cache_fresh_for_repo(user: &str, repo: &str) -> bool {
+	let cache_path = github_cache_path(user, repo);
+	read_cached_tree(&cache_path).is_some()
+}
+
+fn remote_cache_needed(local_buckets: &[String]) -> bool {
+	let Some(known_repos) = known_bucket_repos() else {
+		return true;
+	};
+	let local_set: HashSet<&str> = local_buckets.iter().map(String::as_str).collect();
+	for (bucket, url) in &known_repos {
+		if local_set.contains(bucket.as_str()) {
+			continue;
+		}
+		let Some((user, repo)) = parse_github_repo(url) else {
+			return true;
+		};
+		if !github_cache_fresh_for_repo(&user, &repo) {
+			return true;
+		}
+	}
+	false
+}
+
 fn search_remote_bucket(agent: &Agent, bucket: &str, url: &str, re: &Regex) -> Vec<RemoteResult> {
 	let mut results = Vec::new();
 	let Some((user, repo)) = parse_github_repo(url) else {
 		return results;
 	};
-	let api_url = format!("https://api.github.com/repos/{user}/{repo}/git/trees/HEAD?recursive=1");
-	let Ok(mut body) = github_request(agent, &api_url) else {
-		return results;
-	};
-	let Ok(tree) = body.read_json::<GitHubTree>() else {
+	let Some(tree) = github_tree_cached(agent, &user, &repo) else {
 		return results;
 	};
 	for entry in tree.tree {
@@ -424,7 +555,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 	if let Some(q) = query {
 		let re = Regex::new(&format!("(?i){q}"))?;
 		let agent = create_agent();
-		if !github_rate_limit_ok(&agent) {
+		if remote_cache_needed(&bucket_order) && !github_rate_limit_ok(&agent) {
 			eprintln!("GitHub API rate limit exceeded. Set GH_TOKEN or GITHUB_TOKEN for higher limits.");
 			println!("No matches found.");
 			return Ok(1);
