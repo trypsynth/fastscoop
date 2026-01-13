@@ -457,9 +457,9 @@ fn print_results(results: &[SearchResult], show_header: bool) {
 		source_w = source_w.max(r.bucket.len());
 		binaries_w = binaries_w.max(r.binaries.len());
 	}
-	println!("{name_h:<name_w$}  {version_h:<version_w$}  {source_h:<source_w$}  {binaries_h:<binaries_w$}");
+	println!("{name_h:<name_w$} {version_h:<version_w$} {source_h:<source_w$} {binaries_h:<binaries_w$}");
 	println!(
-		"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
+		"{:<name_w$} {:<version_w$} {:<source_w$} {:<binaries_w$}",
 		"-".repeat(name_h.len()),
 		"-".repeat(version_h.len()),
 		"-".repeat(source_h.len()),
@@ -471,7 +471,7 @@ fn print_results(results: &[SearchResult], show_header: bool) {
 	);
 	for r in results {
 		println!(
-			"{:<name_w$}  {:<version_w$}  {:<source_w$}  {:<binaries_w$}",
+			"{:<name_w$} {:<version_w$} {:<source_w$} {:<binaries_w$}",
 			r.name,
 			r.version,
 			r.bucket,
@@ -485,7 +485,7 @@ fn print_results(results: &[SearchResult], show_header: bool) {
 }
 
 fn print_remote_results(results: &[RemoteResult]) {
-	println!("\nResults from other known buckets...");
+	println!("Results from other known buckets...");
 	println!("(add them using 'scoop bucket add <bucket name>')\n");
 	let name_h = "Name";
 	let source_h = "Source";
@@ -495,16 +495,16 @@ fn print_remote_results(results: &[RemoteResult]) {
 		name_w = name_w.max(r.name.len());
 		source_w = source_w.max(r.bucket.len());
 	}
-	println!("{name_h:<name_w$}  {source_h:<source_w$}");
+	println!("{name_h:<name_w$} {source_h:<source_w$}");
 	println!(
-		"{:<name_w$}  {:<source_w$}",
+		"{:<name_w$} {:<source_w$}",
 		"-".repeat(name_h.len()),
 		"-".repeat(source_h.len()),
 		name_w = name_w,
 		source_w = source_w
 	);
 	for r in results {
-		println!("{:<name_w$}  {:<source_w$}", r.name, r.bucket, name_w = name_w, source_w = source_w);
+		println!("{:<name_w$} {:<source_w$}", r.name, r.bucket, name_w = name_w, source_w = source_w);
 	}
 }
 
