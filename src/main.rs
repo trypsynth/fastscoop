@@ -8,9 +8,11 @@ use std::{
 	fs,
 	path::{Path, PathBuf},
 	process, string,
+	sync::Mutex,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -407,20 +409,57 @@ fn match_bins(bin: Option<&Value>, re: &Regex) -> Vec<String> {
 	matches
 }
 
-fn walk_manifests(buckets: &[String], mut f: impl FnMut(&str, &Path)) {
+fn walk_manifests(buckets: &[String], re: Option<&Regex>) -> Vec<SearchResult> {
 	let buckets_path = buckets_dir();
-	for bucket in buckets {
-		let bucket_path = buckets_path.join(bucket).join("bucket");
-		let Ok(entries) = fs::read_dir(&bucket_path) else {
-			continue;
+
+	let tasks: Vec<(String, PathBuf)> = buckets
+		.iter()
+		.flat_map(|bucket| {
+			let bucket_path = buckets_path.join(bucket).join("bucket");
+			let entries: Vec<_> = fs::read_dir(&bucket_path)
+				.into_iter()
+				.flatten()
+				.flatten()
+				.filter(|e| e.path().extension() == Some(OsStr::new("json")))
+				.map(|e| (bucket.clone(), e.path()))
+				.collect();
+			entries
+		})
+		.collect();
+
+	let results: Mutex<Vec<SearchResult>> = Mutex::new(Vec::with_capacity(128));
+
+	tasks.par_iter().for_each(|(bucket, path)| {
+		let Some((name, version, bin)) = load_manifest(path) else {
+			return;
 		};
-		for entry in entries.flatten() {
-			let path = entry.path();
-			if path.extension() == Some(OsStr::new("json")) {
-				f(bucket, &path);
+		match re {
+			Some(re) => {
+				if re.is_match(&name) {
+					if let Ok(mut r) = results.lock() {
+						r.push(SearchResult { name, version, bucket: bucket.clone(), binaries: String::new() });
+					}
+					return;
+				}
+				let bins = match_bins(bin.as_ref(), re);
+				if !bins.is_empty()
+					&& let Ok(mut r) = results.lock()
+				{
+					r.push(SearchResult { name, version, bucket: bucket.clone(), binaries: bins.join(" | ") });
+				}
+			}
+			None => {
+				if let Ok(mut r) = results.lock() {
+					r.push(SearchResult { name, version, bucket: bucket.clone(), binaries: String::new() });
+				}
 			}
 		}
-	}
+	});
+
+	let bucket_order: Vec<String> = buckets.to_vec();
+	let mut results = results.into_inner().unwrap();
+	sort_results(&mut results, &bucket_order);
+	results
 }
 
 fn sort_results(results: &mut [SearchResult], bucket_order: &[String]) {
@@ -432,10 +471,10 @@ fn sort_results(results: &mut [SearchResult], bucket_order: &[String]) {
 		order_index.insert(b.as_str(), i);
 	}
 	let unknown_index = bucket_order.len() + 1;
-	results.sort_by(|a, b| {
-		let ai = order_index.get(a.bucket.as_str()).copied().unwrap_or(unknown_index);
-		let bi = order_index.get(b.bucket.as_str()).copied().unwrap_or(unknown_index);
-		ai.cmp(&bi).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())).then_with(|| a.name.cmp(&b.name))
+	results.sort_by_cached_key(|r| {
+		let bucket_ord = order_index.get(r.bucket.as_str()).copied().unwrap_or(unknown_index);
+		let name_lower = r.name.to_lowercase();
+		(bucket_ord, name_lower, r.name.clone())
 	});
 }
 
@@ -515,38 +554,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
 		return Ok(1);
 	}
 	let bucket_order = local_buckets()?;
-	let mut results: Vec<SearchResult> = Vec::with_capacity(128);
 	let query = args.get(2);
 	let re = match query {
 		Some(q) => Some(Regex::new(&format!("(?i){q}")).map_err(|e| format!("Invalid regular expression: {e}"))?),
 		None => None,
 	};
-	walk_manifests(&bucket_order, |bucket, path| {
-		let Some((name, version, bin)) = load_manifest(path) else {
-			return;
-		};
-		match &re {
-			Some(re) => {
-				if re.is_match(&name) {
-					results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
-					return;
-				}
-				let bins = match_bins(bin.as_ref(), re);
-				if !bins.is_empty() {
-					results.push(SearchResult {
-						name,
-						version,
-						bucket: bucket.to_string(),
-						binaries: bins.join(" | "),
-					});
-				}
-			}
-			None => {
-				results.push(SearchResult { name, version, bucket: bucket.to_string(), binaries: String::new() });
-			}
-		}
-	});
-	sort_results(&mut results, &bucket_order);
+	let results = walk_manifests(&bucket_order, re.as_ref());
 	let has_local_results = !results.is_empty();
 	if has_local_results {
 		print_results(&results, query.is_some());
