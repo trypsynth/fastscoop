@@ -11,10 +11,10 @@ keywords = ["scoop", "search", "windows", "package-manager", "cli"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-regex = "1.12.4"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["preserve_order"] }
-ureq = { version = "3.3.0", features = ["json"] }
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+ureq = { version = "3.4.0", features = ["json"] }
 
 [profile.release]
 codegen-units = 1
